@@ -1,10 +1,16 @@
 // mc-router-ec2.js
 require('dotenv').config();
 const net = require('net');
-const { EC2Client, DescribeInstancesCommand, StartInstancesCommand } = require('@aws-sdk/client-ec2');
+const fs = require('fs');
+const path = require('path');
+const {
+  EC2Client,
+  DescribeInstancesCommand,
+  StartInstancesCommand
+} = require('@aws-sdk/client-ec2');
 
 const LISTEN_PORT = Number(process.env.PROXY_PORT || 25565);
-const LISTEN_HOST = '0.0.0.0';
+const LISTEN_HOST = process.env.PROXY_HOST || '0.0.0.0';
 
 // EC2 config
 const REGION = process.env.AWS_REGION || 'us-west-2';
@@ -14,18 +20,36 @@ if (!INSTANCE_ID) throw new Error('EC2_INSTANCE_ID env var required');
 const START_POLL_INTERVAL_MS = Number(process.env.START_POLL_INTERVAL_MS || 5000);
 const START_TIMEOUT_MS = Number(process.env.START_TIMEOUT_MS || 5 * 60 * 1000);
 
+// Kick responder (local) defaults
+const KICK_HOST = process.env.KICK_HOST || '127.0.0.1';
+const KICK_PORT = Number(process.env.KICK_PORT || 25567);
+
+// ROUTES file
+const ROUTES_FILE = process.env.ROUTES_FILE || path.join(__dirname, 'routes.json');
+
 const ec2 = new EC2Client({ region: REGION });
 
-// Map hostnames to backend ports (local backends) OR you can map to special keyword "ec2"
-// Example: route to ec2's public IP when ready. We'll support "ec2" mapping.
-const ROUTES = {
-  // subdomain -> backend info
-  // 'mc.example.com': { type: 'local', host: '127.0.0.1', port: 25565 },
-  'mc.example.com': { type: 'ec2' }, // route to EC2 instance (public DNS/ip when running)
-  'us.example.com': { type: 'local', host: '127.0.0.1', port: 25566 },
-};
+let ROUTES = {};
+function loadRoutes() {
+  try {
+    const raw = fs.readFileSync(ROUTES_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    ROUTES = parsed;
+    console.log(`[routes] loaded ${Object.keys(ROUTES).length} routes from ${ROUTES_FILE}`);
+  } catch (err) {
+    console.warn('[routes] failed to load routes file:', err.message || err);
+    ROUTES = {};
+  }
+}
+loadRoutes();
 
-// Helpers to read VarInt from buffer
+// Optional: reload routes on SIGHUP
+process.on('SIGHUP', () => {
+  console.log('[routes] SIGHUP received — reloading routes file');
+  loadRoutes();
+});
+
+// Helpers: VarInt parsing (handshake)
 function readVarInt(buf, offset = 0) {
   let numRead = 0;
   let result = 0;
@@ -41,12 +65,49 @@ function readVarInt(buf, offset = 0) {
   return { value: result, size: numRead };
 }
 
+function normalizeHost(h) {
+  if (!h) return h;
+  let host = h.trim().toLowerCase();
+  if (host.endsWith('.')) host = host.slice(0, -1);
+  // strip :port if present
+  const colonIdx = host.lastIndexOf(':');
+  if (colonIdx !== -1 && /^\d+$/.test(host.slice(colonIdx + 1))) {
+    host = host.slice(0, colonIdx);
+  }
+  if (host.startsWith('www.')) host = host.slice(4);
+  return host;
+}
+
 function looksLikeIp(host) {
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
   if (/^\[?[0-9a-fA-F:]+\]?$/.test(host) && host.includes(':')) return true;
   return false;
 }
 
+// Route lookup: exact -> wildcard (*.example.com) -> suffix match (example.com)
+function findRouteFor(host) {
+  if (!host) return null;
+  if (ROUTES[host]) return ROUTES[host];
+
+  // wildcard entries like "*.example.com"
+  for (const pattern of Object.keys(ROUTES)) {
+    if (pattern.startsWith('*.')) {
+      const suffix = pattern.slice(1); // ".example.com"
+      if (host.endsWith(suffix)) return ROUTES[pattern];
+    }
+  }
+
+  // fallback: exact domain suffix match (e.g., "example.com" route catches "sub.example.com")
+  for (const pattern of Object.keys(ROUTES)) {
+    if (!pattern.includes('*') && pattern.split('.').length >= 2) {
+      if (host === pattern || host.endsWith('.' + pattern)) return ROUTES[pattern];
+    }
+  }
+
+  return null;
+}
+
+// EC2 helpers
 async function describeInstance() {
   const cmd = new DescribeInstancesCommand({ InstanceIds: [INSTANCE_ID] });
   const res = await ec2.send(cmd);
@@ -65,32 +126,78 @@ function tryTcpConnect(host, port, timeout = 2000) {
   });
 }
 
-async function startInstanceAndWaitForPort(port = 25565) {
-  console.log('[ec2] starting instance', INSTANCE_ID);
-  await ec2.send(new StartInstancesCommand({ InstanceIds: [INSTANCE_ID] })).catch(e => {
-    console.warn('[ec2] startInstances error', e.message || e);
-  });
-  const startAt = Date.now();
-  while (Date.now() - startAt < START_TIMEOUT_MS) {
-    await new Promise(r => setTimeout(r, START_POLL_INTERVAL_MS));
-    try {
-      const info = await describeInstance();
-      console.log('[ec2] state:', info.state, 'host:', info.host);
-      if (info.state === 'running' && info.host) {
-        // check port
-        const ok = await tryTcpConnect(info.host, port, 1500);
-        if (ok) {
-          console.log('[ec2] found open port on', info.host);
-          return info.host;
-        } else {
-          console.log('[ec2] port not open yet');
-        }
-      }
-    } catch (err) {
-      console.warn('[ec2] describe error', err.message || err);
-    }
+let startInProgress = false;
+async function startInstanceBackground(port = 25565) {
+  if (startInProgress) {
+    console.log('[ec2] start already in progress — skipping duplicate start');
+    return;
   }
-  throw new Error('Timed out waiting for instance to be ready');
+  startInProgress = true;
+  console.log('[ec2] initiating background start for', INSTANCE_ID);
+  try {
+    await ec2.send(new StartInstancesCommand({ InstanceIds: [INSTANCE_ID] })).catch(e => {
+      console.warn('[ec2] startInstances error', e.message || e);
+    });
+
+    const startAt = Date.now();
+    while (Date.now() - startAt < START_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, START_POLL_INTERVAL_MS));
+      try {
+        const info = await describeInstance();
+        console.log('[ec2] state:', info.state, 'host:', info.host);
+        if (info.state === 'running' && info.host) {
+          // check port
+          const ok = await tryTcpConnect(info.host, port, 1500);
+          if (ok) {
+            console.log('[ec2] instance ready and port open at', info.host);
+            startInProgress = false;
+            return;
+          } else {
+            console.log('[ec2] instance running but port not open yet');
+          }
+        }
+      } catch (err) {
+        console.warn('[ec2] describe error', err.message || err);
+      }
+    }
+    console.warn('[ec2] timed out waiting for instance to be ready');
+  } catch (err) {
+    console.warn('[ec2] start background error:', err.message || err);
+  } finally {
+    startInProgress = false;
+  }
+}
+
+// Proxy helper: forward buffered handshake + pipe streams
+function proxyToBackend(buffer, client, backendHost, backendPort, onClientData) {
+  const backend = net.connect(backendPort, backendHost, () => {
+    try { backend.write(buffer); } catch (e) {}
+    client.pipe(backend);
+    backend.pipe(client);
+    // stop the handshake parser
+    if (typeof onClientData === 'function') client.removeListener('data', onClientData);
+  });
+
+  const cleanup = () => {
+    try { backend.destroy(); } catch (e) {}
+    try { client.destroy(); } catch (e) {}
+  };
+
+  backend.on('error', (err) => {
+    console.warn('[proxy] backend connection error', backendHost + ':' + backendPort, err.message || err);
+    try { client.end(); } catch (e) {}
+  });
+
+  client.on('error', () => {});
+  client.on('close', cleanup);
+  backend.on('close', () => {
+    try { client.end(); } catch (e) {}
+  });
+}
+
+// Convenience to send them to local kick responder
+function proxyToLocalKick(buffer, client, onClientData) {
+  proxyToBackend(buffer, client, KICK_HOST, KICK_PORT, onClientData);
 }
 
 // Router server
@@ -98,7 +205,7 @@ const server = net.createServer((client) => {
   let buffer = Buffer.alloc(0);
   let routed = false;
 
-  const onClientData = async (chunk) => {
+  async function onClientData(chunk) {
     if (routed) return;
     buffer = Buffer.concat([buffer, chunk]);
 
@@ -126,102 +233,94 @@ const server = net.createServer((client) => {
       const hostEnd = hostStart + hostLen;
       if (buffer.length < hostEnd) return;
 
-      const serverAddress = buffer.slice(hostStart, hostEnd).toString('utf8').toLowerCase();
+      const rawServerAddress = buffer.slice(hostStart, hostEnd).toString('utf8');
+      const serverAddress = normalizeHost(rawServerAddress);
 
-      console.log(`[router] handshake: requested host="${serverAddress}" from ${client.remoteAddress}:${client.remotePort}`);
+      console.log(`[router] handshake: requested host="${rawServerAddress}" normalized="${serverAddress}" from ${client.remoteAddress}:${client.remotePort}`);
 
-      const route = ROUTES[serverAddress];
+      const route = findRouteFor(serverAddress);
 
       if (!route) {
-        console.log(`[router] no route for ${serverAddress}; rejecting`);
-        client.end(); // or send nicer disconnect packet
+        console.log(`[router] no route for "${serverAddress}" (raw: "${rawServerAddress}") — rejecting with kick`);
+        proxyToLocalKick(buffer, client, onClientData); // friendly rejection
         routed = true;
         return;
       }
 
-      // If route.type == 'ec2', check instance and possibly start
       if (route.type === 'ec2') {
         let info;
         try {
           info = await describeInstance();
         } catch (err) {
           console.warn('[ec2] describe failed', err.message || err);
-          client.end();
+          proxyToLocalKick(buffer, client, onClientData);
           routed = true;
           return;
         }
 
         if (info.state === 'running' && info.host) {
-          // connect to EC2 host (raw)
-          const backend = net.connect(25565, info.host, () => {
-            backend.write(buffer);
-            client.pipe(backend);
-            backend.pipe(client);
-            routed = true;
-            console.log(`[router] proxied to ec2 ${info.host}:25565`);
-          });
-          backend.on('error', (err) => {
-            console.warn('[router] backend error', err.message || err);
-            try { client.end(); } catch (e) {}
-          });
-          // remove our temporary listener
-          client.removeListener('data', onClientData);
+          // proxy raw to EC2 host
+          proxyToBackend(buffer, client, info.host, 25565, onClientData);
+          routed = true;
+          console.log(`[router] proxied to EC2 ${info.host}:25565`);
           return;
         }
 
-        // if not running -> start and tell player to rejoin
+        // not running → kick with friendly message and start EC2 in background
         try {
-          console.log('[router] instance not running; starting...');
-          const host = await startInstanceAndWaitForPort(25565);
-          console.log('[router] instance ready at', host);
-          // politely disconnect; client will need to rejoin
-          // We close socket here. You can craft a nicer disconnect JSON packet if desired.
-          try {
-            client.end(); // client sees Connection closed; you can improve by sending MC disconnect
-          } catch (e) {}
+          console.log('[router] EC2 instance not running. initiating start and sending friendly kick.');
+          // start asynchronously (so many clients don't cause blocking)
+          startInstanceBackground(25565).catch(e => console.warn('[ec2] bg start error', e.message || e));
+          proxyToLocalKick(buffer, client, onClientData);
           routed = true;
           return;
         } catch (err) {
           console.warn('[router] failed to start/wait:', err.message || err);
-          client.end();
+          proxyToLocalKick(buffer, client, onClientData);
           routed = true;
           return;
         }
       } else if (route.type === 'local') {
-        // connect to local backend
-        const backend = net.connect(route.port, route.host, () => {
-          backend.write(buffer);
-          client.pipe(backend);
-          backend.pipe(client);
-          routed = true;
-          console.log(`[router] proxied to ${route.host}:${route.port}`);
-        });
-
-        backend.on('error', (err) => {
-          console.warn('[router] backend error', err.message || err);
-          try { client.end(); } catch (e) {}
-        });
-
-        client.removeListener('data', onClientData);
+        // connect to local backend (host/port supplied in ROUTES)
+        const host = route.host || '127.0.0.1';
+        const port = Number(route.port || 25565);
+        proxyToBackend(buffer, client, host, port, onClientData);
+        routed = true;
+        console.log(`[router] proxied to local backend ${host}:${port}`);
         return;
       } else {
         console.warn('[router] unknown route type', route);
-        client.end();
+        proxyToLocalKick(buffer, client, onClientData);
         routed = true;
         return;
       }
 
     } catch (err) {
       console.error('[router] parse error', err);
-      client.end();
+      try { client.end(); } catch (e) {}
       routed = true;
     }
-  };
+  } // onClientData
 
   client.on('data', onClientData);
-  client.on('error', (err) => { /* ignore */ });
+  client.on('error', () => {});
 });
 
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+server.on('listening', () => {
   console.log(`Handshake router listening on ${LISTEN_HOST}:${LISTEN_PORT}`);
 });
+
+server.on('error', (err) => {
+  console.error('[router] server error', err);
+});
+
+server.listen(LISTEN_PORT, LISTEN_HOST);
+
+// graceful shutdown
+function shutdown() {
+  console.log('[router] shutting down');
+  try { server.close(); } catch (e) {}
+  setTimeout(() => process.exit(0), 1000);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
