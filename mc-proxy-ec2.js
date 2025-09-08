@@ -1,242 +1,227 @@
-/**
- * mc-proxy-ec2.js
- *
- * Simple Minecraft authing proxy that starts/stops an EC2 instance.
- *
- * npm deps:
- *   npm i minecraft-protocol @aws-sdk/client-ec2 dotenv
- *
- * Environment variables (use .env or system env):
- *   AWS_REGION             e.g. us-west-2
- *   AWS_ACCESS_KEY_ID
- *   AWS_SECRET_ACCESS_KEY
- *   EC2_INSTANCE_ID        (the instance you want started/stopped)
- *   PROXY_PORT             (default 25565)
- *   START_POLL_INTERVAL_MS (optional, default 5000)
- *   START_TIMEOUT_MS       (optional, default 5*60*1000)
- *   SHUTDOWN_IDLE_MINUTES  (optional, default 10)
- *
- * NOTE: this is a simple example. Harden before production.
- */
-
+// mc-router-ec2.js
 require('dotenv').config();
-const mc = require('minecraft-protocol');
 const net = require('net');
-const {
-  EC2Client,
-  StartInstancesCommand,
-  StopInstancesCommand,
-  DescribeInstancesCommand,
-} = require('@aws-sdk/client-ec2');
+const { EC2Client, DescribeInstancesCommand, StartInstancesCommand } = require('@aws-sdk/client-ec2');
 
-// const REGION = process.env.AWS_REGION || 'us-west-2';
-const INSTANCE_ID = process.env.EC2_INSTANCE_ID;
+const LISTEN_PORT = Number(process.env.PROXY_PORT || 25565);
+const LISTEN_HOST = '0.0.0.0';
+
+// EC2 config
+const REGION = process.env.AWS_REGION || 'us-west-2';
+const INSTANCE_ID = process.env.EC2_INSTANCE_ID; // REQUIRED
 if (!INSTANCE_ID) throw new Error('EC2_INSTANCE_ID env var required');
 
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '25565', 10);
-const START_POLL_INTERVAL_MS = parseInt(process.env.START_POLL_INTERVAL_MS || '5000', 10);
-const START_TIMEOUT_MS = parseInt(process.env.START_TIMEOUT_MS || String(5 * 60 * 1000), 10);
-const SHUTDOWN_IDLE_MINUTES = parseInt(process.env.SHUTDOWN_IDLE_MINUTES || '10', 10);
+const START_POLL_INTERVAL_MS = Number(process.env.START_POLL_INTERVAL_MS || 5000);
+const START_TIMEOUT_MS = Number(process.env.START_TIMEOUT_MS || 5 * 60 * 1000);
 
 const ec2 = new EC2Client({ region: REGION });
 
-let targetHostCache = null; // updated from DescribeInstances (PublicDnsName or IP)
-let instanceStateCache = null; // last known state
+// Map hostnames to backend ports (local backends) OR you can map to special keyword "ec2"
+// Example: route to ec2's public IP when ready. We'll support "ec2" mapping.
+const ROUTES = {
+  // subdomain -> backend info
+  // 'mc.example.com': { type: 'local', host: '127.0.0.1', port: 25565 },
+  'mc.example.com': { type: 'ec2' }, // route to EC2 instance (public DNS/ip when running)
+  'us.example.com': { type: 'local', host: '127.0.0.1', port: 25566 },
+};
 
-// track proxied players count
-const activePlayers = new Set();
-let lastNoPlayersAt = null;
+// Helpers to read VarInt from buffer
+function readVarInt(buf, offset = 0) {
+  let numRead = 0;
+  let result = 0;
+  let read;
+  do {
+    if (offset + numRead >= buf.length) return null; // incomplete
+    read = buf[offset + numRead];
+    const value = (read & 0b01111111);
+    result |= (value << (7 * numRead));
+    numRead++;
+    if (numRead > 5) throw new Error('VarInt too big');
+  } while ((read & 0b10000000) !== 0);
+  return { value: result, size: numRead };
+}
+
+function looksLikeIp(host) {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
+  if (/^\[?[0-9a-fA-F:]+\]?$/.test(host) && host.includes(':')) return true;
+  return false;
+}
 
 async function describeInstance() {
   const cmd = new DescribeInstancesCommand({ InstanceIds: [INSTANCE_ID] });
   const res = await ec2.send(cmd);
   const inst = res.Reservations?.[0]?.Instances?.[0];
-  if (!inst) throw new Error('Instance not found in DescribeInstances');
-  instanceStateCache = inst.State?.Name; // e.g., pending, running, stopped
-  // prefer public DNS or public IP; fall back to private IP
-  targetHostCache = inst.PublicDnsName || inst.PublicIpAddress || inst.PrivateIpAddress;
-  return { state: instanceStateCache, publicDns: targetHostCache };
+  if (!inst) throw new Error('Instance not found');
+  const state = inst.State?.Name;
+  const host = inst.PublicDnsName || inst.PublicIpAddress || inst.PrivateIpAddress || null;
+  return { state, host, raw: inst };
 }
 
-async function startInstance() {
-  console.log('Starting EC2 instance', INSTANCE_ID);
-  await ec2.send(new StartInstancesCommand({ InstanceIds: [INSTANCE_ID] }));
+function tryTcpConnect(host, port, timeout = 2000) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host, port }, () => { s.end(); resolve(true); });
+    s.on('error', () => resolve(false));
+    s.setTimeout(timeout, () => { s.destroy(); resolve(false); });
+  });
+}
+
+async function startInstanceAndWaitForPort(port = 25565) {
+  console.log('[ec2] starting instance', INSTANCE_ID);
+  await ec2.send(new StartInstancesCommand({ InstanceIds: [INSTANCE_ID] })).catch(e => {
+    console.warn('[ec2] startInstances error', e.message || e);
+  });
   const startAt = Date.now();
-  // poll until running and remote MC port is accepting connections or timeout
   while (Date.now() - startAt < START_TIMEOUT_MS) {
     await new Promise(r => setTimeout(r, START_POLL_INTERVAL_MS));
     try {
       const info = await describeInstance();
-      console.log('describeInstance: state=', info.state);
-      if (info.state === 'running') {
-        // try to see if Minecraft port 25565 is accepting connections on the public DNS
-        const host = targetHostCache;
-        if (!host) continue;
-        const port = 25565;
-        const ok = await tryTcpConnect(host, port, 1500);
+      console.log('[ec2] state:', info.state, 'host:', info.host);
+      if (info.state === 'running' && info.host) {
+        // check port
+        const ok = await tryTcpConnect(info.host, port, 1500);
         if (ok) {
-          console.log('Server port is open; instance started and server accepted connection');
-          return true;
+          console.log('[ec2] found open port on', info.host);
+          return info.host;
         } else {
-          console.log('Port not open yet, will keep waiting...');
+          console.log('[ec2] port not open yet');
         }
       }
     } catch (err) {
-      console.warn('while starting instance:', err?.message || err);
+      console.warn('[ec2] describe error', err.message || err);
     }
   }
-  console.warn('startInstance: timeout waiting for instance/server to be ready');
-  return false;
+  throw new Error('Timed out waiting for instance to be ready');
 }
 
-async function stopInstance() {
-  console.log('Stopping EC2 instance', INSTANCE_ID);
-  await ec2.send(new StopInstancesCommand({ InstanceIds: [INSTANCE_ID] }));
-  // optionally update caches
-  await describeInstance().catch(()=>{});
-}
+// Router server
+const server = net.createServer((client) => {
+  let buffer = Buffer.alloc(0);
+  let routed = false;
 
-function tryTcpConnect(host, port, timeout = 2000) {
-  return new Promise(resolve => {
-    const s = net.connect({ host, port }, () => {
-      s.end();
-      resolve(true);
-    });
-    s.on('error', () => resolve(false));
-    s.setTimeout(timeout, () => {
-      s.destroy();
-      resolve(false);
-    });
-  });
-}
+  const onClientData = async (chunk) => {
+    if (routed) return;
+    buffer = Buffer.concat([buffer, chunk]);
 
-// create the MC proxy server (onlineMode true => authenticates with Mojang/Microsoft)
-const server = mc.createServer({
-  'online-mode': true, // validate real Minecraft accounts
-  encryption: true,
-  host: '0.0.0.0',
-  port: PROXY_PORT,
-  version: '1.20.1' // pick the server version you want to accept; match your server or use 'auto'
-});
+    try {
+      // parse packet length
+      const lenInfo = readVarInt(buffer, 0);
+      if (!lenInfo) return;
+      const packetLength = lenInfo.value;
+      const lenSize = lenInfo.size;
+      if (buffer.length < lenSize + packetLength) return;
 
-server.on('listening', () => {
-  console.log(`Proxy listening on 0.0.0.0:${PROXY_PORT}`);
-  // refresh initial instance state
-  describeInstance().catch(e => console.warn('initial describe failed', e?.message || e));
-});
+      const idInfo = readVarInt(buffer, lenSize);
+      if (!idInfo) return;
+      const afterId = lenSize + idInfo.size;
 
-server.on('error', (err) => {
-  console.error('Proxy server error:', err);
-});
+      const pvInfo = readVarInt(buffer, afterId); // protocol version
+      if (!pvInfo) return;
+      const afterPv = afterId + pvInfo.size;
 
-server.on('login', async (client) => {
-  // client has authenticated with Mojang/Microsoft by this point (minecraft-protocol handles it)
-  // client.username and client.uuid are available
-  console.log(`Login from ${client.username} (${client.uuid})`);
+      const hostLenInfo = readVarInt(buffer, afterPv);
+      if (!hostLenInfo) return;
+      const hostLen = hostLenInfo.value;
+      const hostLenSize = hostLenInfo.size;
+      const hostStart = afterPv + hostLenSize;
+      const hostEnd = hostStart + hostLen;
+      if (buffer.length < hostEnd) return;
 
-  // Refresh instance state
-  let info;
-  try {
-    info = await describeInstance();
-  } catch (err) {
-    console.error('Failed to describe instance:', err);
-    client.end(`§cServer error (cannot verify host). Try again later.`);
-    return;
-  }
+      const serverAddress = buffer.slice(hostStart, hostEnd).toString('utf8').toLowerCase();
 
-  if (info.state !== 'running') {
-    // server not running -> start it and tell the player to rejoin
-    const started = await startInstance();
-    if (started) {
-      client.end('§aServer was offline. It is now starting — please rejoin in 60–120s.');
-    } else {
-      client.end('§cFailed to start the server. Please try again later.');
+      console.log(`[router] handshake: requested host="${serverAddress}" from ${client.remoteAddress}:${client.remotePort}`);
+
+      const route = ROUTES[serverAddress];
+
+      if (!route) {
+        console.log(`[router] no route for ${serverAddress}; rejecting`);
+        client.end(); // or send nicer disconnect packet
+        routed = true;
+        return;
+      }
+
+      // If route.type == 'ec2', check instance and possibly start
+      if (route.type === 'ec2') {
+        let info;
+        try {
+          info = await describeInstance();
+        } catch (err) {
+          console.warn('[ec2] describe failed', err.message || err);
+          client.end();
+          routed = true;
+          return;
+        }
+
+        if (info.state === 'running' && info.host) {
+          // connect to EC2 host (raw)
+          const backend = net.connect(25565, info.host, () => {
+            backend.write(buffer);
+            client.pipe(backend);
+            backend.pipe(client);
+            routed = true;
+            console.log(`[router] proxied to ec2 ${info.host}:25565`);
+          });
+          backend.on('error', (err) => {
+            console.warn('[router] backend error', err.message || err);
+            try { client.end(); } catch (e) {}
+          });
+          // remove our temporary listener
+          client.removeListener('data', onClientData);
+          return;
+        }
+
+        // if not running -> start and tell player to rejoin
+        try {
+          console.log('[router] instance not running; starting...');
+          const host = await startInstanceAndWaitForPort(25565);
+          console.log('[router] instance ready at', host);
+          // politely disconnect; client will need to rejoin
+          // We close socket here. You can craft a nicer disconnect JSON packet if desired.
+          try {
+            client.end(); // client sees Connection closed; you can improve by sending MC disconnect
+          } catch (e) {}
+          routed = true;
+          return;
+        } catch (err) {
+          console.warn('[router] failed to start/wait:', err.message || err);
+          client.end();
+          routed = true;
+          return;
+        }
+      } else if (route.type === 'local') {
+        // connect to local backend
+        const backend = net.connect(route.port, route.host, () => {
+          backend.write(buffer);
+          client.pipe(backend);
+          backend.pipe(client);
+          routed = true;
+          console.log(`[router] proxied to ${route.host}:${route.port}`);
+        });
+
+        backend.on('error', (err) => {
+          console.warn('[router] backend error', err.message || err);
+          try { client.end(); } catch (e) {}
+        });
+
+        client.removeListener('data', onClientData);
+        return;
+      } else {
+        console.warn('[router] unknown route type', route);
+        client.end();
+        routed = true;
+        return;
+      }
+
+    } catch (err) {
+      console.error('[router] parse error', err);
+      client.end();
+      routed = true;
     }
-    return;
-  }
-
-  // instance is running. connect to the real server and proxy data.
-  const upstreamHost = targetHostCache;
-  const upstreamPort = 25565;
-
-  if (!upstreamHost) {
-    client.end('§cServer host unknown. Contact admin.');
-    return;
-  }
-
-  const downstream = mc.createClient({
-    host: upstreamHost,
-    port: upstreamPort,
-    username: client.username,
-    // if the upstream server is online-mode=true, downstream client must be authenticated.
-    // We re-use the client's login/profile to forward; minecraft-protocol handles encryption.
-    keepAlive: false,
-    version: client.version
-  });
-
-  // proxy packets both ways
-  client.on('packet', (data, meta) => {
-    // forward everything
-    try { downstream.write(meta.name, data); } catch (e) {}
-  });
-
-  downstream.on('packet', (data, meta) => {
-    try { client.write(meta.name, data); } catch (e) {}
-  });
-
-  // handle end / close
-  const cleanup = () => {
-    try { client.end(); } catch (e) {}
-    try { downstream.end(); } catch (e) {}
-    activePlayers.delete(client.username);
-    if (activePlayers.size === 0) lastNoPlayersAt = Date.now();
   };
 
-  downstream.on('end', cleanup);
-  downstream.on('error', (err) => {
-    console.warn('downstream error', err?.message || err);
-    cleanup();
-  });
-
-  client.on('end', cleanup);
-  client.on('error', (err) => {
-    console.warn('client error', err?.message || err);
-    cleanup();
-  });
-
-  // mark player active
-  activePlayers.add(client.username);
-  lastNoPlayersAt = null; // someone is online now
+  client.on('data', onClientData);
+  client.on('error', (err) => { /* ignore */ });
 });
 
-// periodic idle-check every minute, but shutdown only after configured idle minutes
-setInterval(async () => {
-  try {
-    // if activePlayers > 0, nothing to do
-    if (activePlayers.size > 0) {
-      // reset lastNoPlayersAt because we have players
-      lastNoPlayersAt = null;
-      return;
-    }
-
-    // if we have no players and we already recorded when that happened:
-    if (!lastNoPlayersAt) {
-      lastNoPlayersAt = Date.now();
-      return;
-    }
-
-    const idleMs = Date.now() - lastNoPlayersAt;
-    const idleNeeded = SHUTDOWN_IDLE_MINUTES * 60 * 1000;
-    if (idleMs >= idleNeeded) {
-      // double-check instance state and stop
-      await describeInstance();
-      if (instanceStateCache === 'running') {
-        console.log(`No players for ${SHUTDOWN_IDLE_MINUTES} minutes — shutting down instance`);
-        await stopInstance();
-        lastNoPlayersAt = null; // reset
-      }
-    }
-  } catch (err) {
-    console.warn('Idle-check error:', err?.message || err);
-  }
-}, 60 * 1000); // every minute
+server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  console.log(`Handshake router listening on ${LISTEN_HOST}:${LISTEN_PORT}`);
+});
