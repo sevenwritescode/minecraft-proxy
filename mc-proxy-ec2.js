@@ -29,8 +29,11 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // every minute
 // Kick responder (local) defaults - embedded so it's always available
 const KICK_HOST = process.env.KICK_HOST || '127.0.0.1';
 const KICK_PORT = Number(process.env.KICK_PORT || 25567);
-const KICK_MC_VERSION = process.env.KICK_MC_VERSION || '1.20.1';
-const KICK_MESSAGE = process.env.KICK_MESSAGE || JSON.stringify({ text: 'Server is starting — please rejoin in ~60s', color: 'yellow' });
+const MC_VERSION  = process.env.KICK_MC_VERSION || '1.20.1';
+const BOOT_MESSAGE = {
+  text: process.env.KICK_TEXT || 'Server is starting up – please rejoin in ~60s',
+  color: 'yellow'
+};
 
 // ROUTES file
 const ROUTES_FILE = process.env.ROUTES_FILE || path.join(__dirname, 'routes.json');
@@ -57,25 +60,34 @@ process.on('SIGHUP', () => { console.log('[routes] SIGHUP - reloading'); loadRou
 // clean in-client popup message.
 function startKickResponder() {
   const srv = mc.createServer({
-    'online-mode': true,
-    encryption: true,
-    host: KICK_HOST,
-    port: KICK_PORT,
-    version: KICK_MC_VERSION
+    host:       KICK_HOST,
+    port:       KICK_PORT,
+    version:    MC_VERSION,
+    'online-mode': true,    // match your real proxy online-mode
+    encryption: true
   });
 
-  srv.on('listening', () => console.log(`[kick] responder listening ${KICK_HOST}:${KICK_PORT}`));
-  srv.on('error', (e) => console.error('[kick] error', e.message || e));
-  srv.on('login', (client) => {
-    try {
-      client.end(KICK_MESSAGE);
-      console.log(`[kick] sent kick to ${client.username}`);
-    } catch (e) {
-      console.warn('[kick] failed to send kick', e.message || e);
-      try { client.end(); } catch (e2) {}
-    }
+  srv.on('listening', () => {
+    console.log(`[kick] listening on ${KICK_HOST}:${KICK_PORT}`);
+  });
+
+  srv.on('error', e => {
+    console.error('[kick] error:', e.message);
+  });
+
+  srv.on('login', client => {
+    // client is now in PLAY state, encryption is already negotiated for you.
+    // Send a real DISCONNECT packet with our JSON chat component:
+    client.write('disconnect', {
+      reason: JSON.stringify(BOOT_MESSAGE)
+    });
+    // Then close the socket.
+    client.once('end', () => {/*noop*/});
+    client.end();
+    console.log('[kick] sent boot-up message to', client.username);
   });
 }
+
 startKickResponder();
 
 // --- VarInt parsing
