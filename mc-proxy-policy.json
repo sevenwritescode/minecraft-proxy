@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowStartStopSpecificInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:RebootInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-west-2:381492080663:instance/i-031703b8c402119df"
+      ]
+    },
+    {
+      "Sid": "AllowDescribeForInstanceLookup",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeTags"
+      ],
+      "Resource": ["*"]
+    }
+  ]
+}
