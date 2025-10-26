@@ -281,9 +281,6 @@ function getMotdObject() {
   const status = getServerStatus();
   const motd = getMotdForStatus(status);
   
-  // Use mcServer.playerCount if available (friendly mode), otherwise use activeSockets (TCP forward mode)
-  const playerCount = mcServer?.playerCount ?? activeSockets.size;
-  
   return {
     version: {
       name: MC_VERSION,
@@ -291,7 +288,7 @@ function getMotdObject() {
     },
     players: {
       max: status === 'online' ? 20 : 0,
-      online: playerCount,
+      online: activeSockets.size,
       sample: []
     },
     description: motd,
@@ -523,7 +520,6 @@ app.get('/status', requireAdmin, async (req, res) => {
   const inst = await describeInstance();
   const status = getServerStatus();
   const motd = getMotdForStatus(status);
-  const playerCount = mcServer?.playerCount ?? activeSockets.size;
   res.json({ 
     backendReady, 
     backendHost, 
@@ -531,7 +527,7 @@ app.get('/status', requireAdmin, async (req, res) => {
     status,
     motd,
     instance: inst?.State?.Name || 'unknown',
-    activePlayers: playerCount
+    activePlayers: activeSockets.size
   });
 });
 
