@@ -300,7 +300,7 @@ function startMinecraftFriendlyServer() {
       console.log('Rejecting non-whitelisted UUID', uuid, 'from', ip);
       // record a failure for this IP
       recordFail(ip);
-      client.end('Error','disconnect');
+      client.end('You are not authorized to start this server.');
       return;
     }
 
@@ -310,7 +310,7 @@ function startMinecraftFriendlyServer() {
 
     
     // friendly disconnect telling the user to reconnect shortly
-    client.end('disconnect',{ message:  JSON.stringify({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.`})});
+    client.end(`Server is starting for authorized player ${username}. Please reconnect in ~45s.`);
   });
 
   mcServer.on('error', (err) => {
