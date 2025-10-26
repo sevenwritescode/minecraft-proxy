@@ -308,6 +308,7 @@ function startMinecraftFriendlyServer() {
     console.log('Authorized UUID, starting instance (if not already)', uuid);
     startInstance();
 
+    client.write(JSON.stringify({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.` }))
     // friendly disconnect telling the user to reconnect shortly
     client.end(JSON.stringify({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.` }));
   });
