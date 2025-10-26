@@ -28,7 +28,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
 
-const ec2 = new EC2Client(clientOpts);
+
 
 const WHITELIST_FILE = path.resolve(__dirname, 'whitelist.json');
 
@@ -64,6 +64,8 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
 } else {
   console.log('EC2Client using default credential provider chain (profile/instance-role/etc).');
 }
+
+const ec2 = new EC2Client(clientOpts);
 
 
 
