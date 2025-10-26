@@ -396,8 +396,9 @@ function switchToTcpForwardMode(targetIp) {
   tcpServer = net.createServer((clientSock) => {
     const ip = clientSock.remoteAddress;
     console.log('forward: client connected', ip, clientSock.remotePort);
-    cancelShutdownTimer();
     const backendSock = net.createConnection({ host: targetIp, port: TARGET_PORT }, () => {
+      // Only cancel shutdown timer when backend connection is successfully established
+      cancelShutdownTimer();
       clientSock.pipe(backendSock);
       backendSock.pipe(clientSock);
       activeSockets.add(clientSock);
