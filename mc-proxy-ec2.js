@@ -310,7 +310,8 @@ function startMinecraftFriendlyServer() {
 
     
     // friendly disconnect telling the user to reconnect shortly
-    client.end(`Server is starting for authorized player ${username}. Please reconnect in ~45s.`);
+    client.chat('Server: Hello — please wait 45s');
+    // client.end(`Server is starting for authorized player ${username}. Please reconnect in ~45s.`);
   });
 
   mcServer.on('error', (err) => {
