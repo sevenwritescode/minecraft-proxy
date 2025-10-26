@@ -44,10 +44,6 @@ if (!INSTANCE_ID) {
   console.error("Please set INSTANCE_ID env var.");
   process.exit(1);
 }
-if (!AWS_SECRET_ACCESS_KEY) {
-  console.error("Please set AWS_SECRET_ACCESS_KEY env var");
-  process.exit(1);
-}
 
 // Build options for EC2Client: explicitly pass credentials if env vars are provided,
 // otherwise leave it to the SDK's default provider chain.
