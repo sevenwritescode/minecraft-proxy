@@ -28,23 +28,6 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
 
-
-// Build options for EC2Client: explicitly pass credentials if env vars are provided,
-// otherwise leave it to the SDK's default provider chain.
-const clientOpts = { region: REGION };
-
-if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
-  clientOpts.credentials = {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    // optional, include if using temporary credentials:
-    sessionToken: process.env.AWS_SESSION_TOKEN || undefined,
-  };
-  console.log('EC2Client configured to use credentials from environment variables.');
-} else {
-  console.log('EC2Client using default credential provider chain (profile/instance-role/etc).');
-}
-
 const ec2 = new EC2Client(clientOpts);
 
 const WHITELIST_FILE = path.resolve(__dirname, 'whitelist.json');
@@ -64,6 +47,22 @@ if (!INSTANCE_ID) {
 if (!ADMIN_TOKEN) {
   console.error("Please set ADMIN_TOKEN env var for admin HTTP API.");
   process.exit(1);
+}
+
+// Build options for EC2Client: explicitly pass credentials if env vars are provided,
+// otherwise leave it to the SDK's default provider chain.
+const clientOpts = { region: REGION };
+
+if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+  clientOpts.credentials = {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    // optional, include if using temporary credentials:
+    sessionToken: process.env.AWS_SESSION_TOKEN || undefined,
+  };
+  console.log('EC2Client configured to use credentials from environment variables.');
+} else {
+  console.log('EC2Client using default credential provider chain (profile/instance-role/etc).');
 }
 
 
