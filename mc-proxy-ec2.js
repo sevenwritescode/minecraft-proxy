@@ -214,6 +214,7 @@ async function stopInstance() {
   } catch (err) {
     console.error('stopInstance error:', err);
   } finally {
+    starting = false;
     backendHost = null;
     backendReady = false;
     switchToFriendlyMode();
@@ -260,6 +261,41 @@ async function pollForIpAndReady() {
   starting = false;
 }
 
+/* ---------- MOTD Helper Functions ---------- */
+function getServerStatus() {
+  if (backendReady) return 'online';
+  if (starting) return 'starting';
+  return 'offline';
+}
+
+function getMotdForStatus(status) {
+  const motds = {
+    offline: '§c§lSERVER OFFLINE §r§7- Connect to start!',
+    starting: '§e§lSERVER STARTING §r§7- Please wait ~45s...',
+    online: '§a§lSERVER ONLINE §r§7- Ready to play!'
+  };
+  return motds[status] || motds.offline;
+}
+
+function getMotdObject() {
+  const status = getServerStatus();
+  const motd = getMotdForStatus(status);
+  
+  return {
+    version: {
+      name: MC_VERSION,
+      protocol: 764 // Protocol number for 1.20.2, adjust if needed
+    },
+    players: {
+      max: status === 'online' ? 20 : 0,
+      online: activeSockets.size,
+      sample: []
+    },
+    description: motd,
+    favicon: null // You can add a base64 favicon here if desired
+  };
+}
+
 /* ---------- Friendly Minecraft server - online-mode ---------- */
 function startMinecraftFriendlyServer() {
   if (mcServer) return;
@@ -268,7 +304,17 @@ function startMinecraftFriendlyServer() {
     host: '0.0.0.0',
     port: PROXY_PORT,
     'online-mode': true,
-    version: MC_VERSION
+    version: MC_VERSION,
+    motd: getMotdForStatus(getServerStatus())
+  });
+
+  // Handle server list ping to show dynamic MOTD
+  mcServer.on('ping', (response) => {
+    const motdData = getMotdObject();
+    response.version = motdData.version;
+    response.players = motdData.players;
+    response.description = motdData.description;
+    if (motdData.favicon) response.favicon = motdData.favicon;
   });
 
   // raw connection event on underlying net.Server to apply token-bucket
@@ -308,11 +354,24 @@ function startMinecraftFriendlyServer() {
     console.log('Authorized UUID, starting instance (if not already)', uuid);
     startInstance();
 
+    // Provide status-specific disconnect message
+    const status = getServerStatus();
+    let disconnectMessage;
     
-    // friendly disconnect telling the user to reconnect shortly
-    // client.chat('Server: Hello — please wait 45s');
-    client.write('disconnect', { reason: JSON.stringify({ text: 'Server starting — reconnect in 45s' }) });
-    // client.end(`Server is starting for authorized player ${username}. Please reconnect in ~45s.`);
+    switch (status) {
+      case 'online':
+        // This shouldn't happen in friendly mode, but just in case
+        disconnectMessage = `Server is online but not yet ready. Please reconnect in a moment.`;
+        break;
+      case 'starting':
+        disconnectMessage = `Server is starting for authorized player ${username}. Please reconnect in ~45s.`;
+        break;
+      default: // offline
+        disconnectMessage = `Server is starting for authorized player ${username}. Please reconnect in ~45s.`;
+        break;
+    }
+    
+    client.end(disconnectMessage);
   });
 
   mcServer.on('error', (err) => {
@@ -445,7 +504,17 @@ app.post('/start', requireAdmin, async (req, res) => { startInstance(); res.json
 app.post('/stop', requireAdmin, async (req, res) => { stopInstance(); res.json({ stopped: true }); });
 app.get('/status', requireAdmin, async (req, res) => {
   const inst = await describeInstance();
-  res.json({ backendReady, backendHost, instance: inst?.State?.Name || 'unknown' });
+  const status = getServerStatus();
+  const motd = getMotdForStatus(status);
+  res.json({ 
+    backendReady, 
+    backendHost, 
+    starting,
+    status,
+    motd,
+    instance: inst?.State?.Name || 'unknown',
+    activePlayers: activeSockets.size
+  });
 });
 
 const ADMIN_PORT = 3000;
@@ -462,16 +531,29 @@ app.listen(ADMIN_PORT, () => console.log(`Admin API listening on http://0.0.0.0:
       const inst = await describeInstance();
       const state = inst?.State?.Name;
       const ip = inst?.PublicIpAddress || null;
+      
       if (state === 'running' && ip && !backendReady) {
         console.log('Detected running instance externally; switching to forward mode', ip);
+        starting = false;
         backendHost = ip;
         backendReady = true;
         switchToTcpForwardMode(ip);
       } else if (state !== 'running' && backendReady) {
         console.log('Instance no longer running — reverting to friendly mode');
+        starting = false;
         backendHost = null;
         backendReady = false;
         switchToFriendlyMode();
+      } else if (state === 'pending' || state === 'starting') {
+        if (!starting) {
+          console.log('Instance is starting up...');
+          starting = true;
+        }
+      } else if (state === 'stopped' || state === 'stopping') {
+        if (starting) {
+          console.log('Instance has stopped');
+          starting = false;
+        }
       }
     } catch (err) {
       // ignore
