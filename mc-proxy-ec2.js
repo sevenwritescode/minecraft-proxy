@@ -396,13 +396,26 @@ function switchToTcpForwardMode(targetIp) {
   tcpServer = net.createServer((clientSock) => {
     const ip = clientSock.remoteAddress;
     console.log('forward: client connected', ip, clientSock.remotePort);
+    
+    let isRealConnection = false;
+    
     const backendSock = net.createConnection({ host: targetIp, port: TARGET_PORT }, () => {
-      // Only cancel shutdown timer when backend connection is successfully established
-      cancelShutdownTimer();
       clientSock.pipe(backendSock);
       backendSock.pipe(clientSock);
       activeSockets.add(clientSock);
     });
+
+    // Only cancel shutdown timer when actual data flows (not just pings)
+    const onFirstData = () => {
+      if (!isRealConnection) {
+        isRealConnection = true;
+        cancelShutdownTimer();
+        console.log('Real player connection detected from', ip);
+      }
+    };
+    
+    clientSock.once('data', onFirstData);
+    backendSock.once('data', onFirstData);
 
     const cleanup = () => {
       activeSockets.delete(clientSock);
