@@ -44,8 +44,8 @@ if (!INSTANCE_ID) {
   console.error("Please set INSTANCE_ID env var.");
   process.exit(1);
 }
-if (!ADMIN_TOKEN) {
-  console.error("Please set ADMIN_TOKEN env var for admin HTTP API.");
+if (!AWS_SECRET_ACCESS_KEY) {
+  console.error("Please set AWS_SECRET_ACCESS_KEY env var");
   process.exit(1);
 }
 
