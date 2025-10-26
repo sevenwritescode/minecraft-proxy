@@ -309,7 +309,21 @@ function startMinecraftFriendlyServer() {
     startInstance();
 
     // friendly disconnect telling the user to reconnect shortly
-    client.end(JSON.stringify({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.` }));
+    // prefer a properly encoded disconnect packet, then close
+    try {
+      // encode disconnect packet properly; `reason` must be a JSON string for modern clients
+      client.write('disconnect', { reason: JSON.stringify({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.`  }) });
+      // give the library a short moment to flush, then end the socket
+      setTimeout(() => client.end(), 50);
+    } catch (err) {
+      // fallback: old versions or weird edge-cases — send plain end as a last resort
+      try {
+        client.end(JSON.stringify({ text: 'Server starting!' }));
+      } catch (e) {
+        client.end(); // best-effort close
+      }
+    }
+
   });
 
   mcServer.on('error', (err) => {
