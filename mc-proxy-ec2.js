@@ -18,7 +18,7 @@
  * Run:
  *   INSTANCE_ID=i-... AWS_REGION=us-east-1 ADMIN_TOKEN=secret node proxy.js
  */
-
+require('dotenv').config();
 const fs = require('fs').promises;
 const path = require('path');
 const net = require('net');
