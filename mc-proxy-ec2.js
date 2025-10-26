@@ -300,7 +300,7 @@ function startMinecraftFriendlyServer() {
       console.log('Rejecting non-whitelisted UUID', uuid, 'from', ip);
       // record a failure for this IP
       recordFail(ip);
-      client.end({ text: 'You are not authorized to start this server.' });
+      sendDisconnect(client, 'You are not authorized to start this server.');
       return;
     }
 
@@ -310,13 +310,27 @@ function startMinecraftFriendlyServer() {
 
     
     // friendly disconnect telling the user to reconnect shortly
-    client.end({ text: `Server is starting for authorized player ${username}. Please reconnect in ~45s.` });
+    sendDisconnect(client, `Server is starting for authorized player ${username}. Please reconnect in ~45s.`);
   });
 
   mcServer.on('error', (err) => {
     console.error('mcServer error', err);
   });
 }
+
+function sendDisconnect(client, message) {
+  // Normalize to chat component object
+  const comp = (typeof message === 'string') ? { text: message } : message;
+
+  // Send the disconnect packet with a JSON-stringified reason (works across versions)
+  try {
+    client.write('disconnect', { reason: JSON.stringify(comp) });
+  } catch (err) {
+    // Fallbacks in case a version doesn't support 'disconnect' or the signature differs
+    try { client.end(comp); } catch (err2) { client.end(JSON.stringify(comp)); }
+  }
+}
+
 
 function stopMinecraftFriendlyServer() {
   if (!mcServer) return;
