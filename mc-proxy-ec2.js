@@ -33,7 +33,7 @@ const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstance
 const WHITELIST_FILE = path.resolve(__dirname, 'whitelist.json');
 
 const INSTANCE_ID = process.env.INSTANCE_ID;
-const REGION = process.env.AWS_REGION || 'us-east-1';
+const REGION = process.env.REGION || 'us-east-1';
 const PROXY_PORT = Number(process.env.PROXY_PORT || 25565);
 const TARGET_PORT = Number(process.env.TARGET_PORT || 25565);
 const MC_VERSION = process.env.MC_VERSION || '1.20.2';
